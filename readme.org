@@ -26,7 +26,25 @@ The build fetches the pinned upstream library source automatically
 * Usage
 
 #+begin_src sh
-sonyctl devices                 # list paired Bluetooth devices
+sonyctl devices                        # list paired Bluetooth devices
+sonyctl status                         # model, firmware, noise mode, battery
+sonyctl mode                           # print current noise mode
+sonyctl battery                        # battery levels (left/right/case)
+
+# noise control (aliases in parentheses)
+sonyctl nc                             # noise cancelling (anc, noise-cancelling)
+sonyctl ambient                        # ambient sound (transparency, passthrough)
+sonyctl ambient --level 12 --voice-focus on
+sonyctl off                            # no noise control (normal)
+sonyctl mode ambient                   # equivalent to 'sonyctl ambient'
+
+# recovery / power
+sonyctl multipoint                     # show multipoint state
+sonyctl multipoint reset               # toggle off then on (fix buggy audio state)
+sonyctl power-off                      # shut down (no remote power-on exists)
+
+# protocol probing
+sonyctl raw 6617 --listen 3            # send raw MDR payload, hex-dump frames
 #+end_src
 
 Device selection: by default =sonyctl= picks the first paired device whose
@@ -34,8 +52,16 @@ name looks like a Sony headphone (=WF-1000XM6= first, then other =WF-=/=WH-=
 models). Override with =--device SUBSTR= (name substring) or
 =--mac 00:11:22:33:44:55=.
 
-More commands (noise mode, battery, multipoint, raw) are being added; see
-=sonyctl help=.
+** Notes
+
+- A setting can only be changed by one MDR session at a time; quit Sony's
+  Sound Connect app on any phone connected to the same earbuds while testing.
+- =multipoint reset= briefly drops the audio link; the next =sonyctl= call may
+  need a second or two while the device's control service reappears (the tool
+  retries automatically).
+- =power-off= is a shutdown, not a restart. The protocol has no power-on or
+  reboot command, and a powered-off device cannot receive one — wake the
+  earbuds physically (open/close the case, or put them in your ears).
 
 * Bluetooth permission (TCC)
 
