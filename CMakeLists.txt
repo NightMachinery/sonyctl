@@ -32,3 +32,5 @@ endforeach ()
 
 add_executable(sonyctl src/main.cpp)
 target_link_libraries(sonyctl PRIVATE mdr mdr-bt)
+
+install(TARGETS sonyctl RUNTIME DESTINATION bin)

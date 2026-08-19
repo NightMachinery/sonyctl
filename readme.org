@@ -23,6 +23,21 @@ cmake --build build
 The build fetches the pinned upstream library source automatically
 (FetchContent); the only third-party dependency it pulls is =fmt=.
 
+** Install
+
+=install.sh= builds a Release binary and installs it to a local bin dir
+(default =~/.local/bin=):
+
+#+begin_src sh
+./install.sh                 # -> ~/.local/bin/sonyctl
+./install.sh /usr/local      # -> /usr/local/bin/sonyctl
+PREFIX=~/opt ./install.sh    # -> ~/opt/bin/sonyctl
+#+end_src
+
+If the target bin dir is not on your =PATH=, the script prints the line to
+add. Under the hood this is just =cmake --install=, so you can also run
+=cmake --install build --prefix ~/.local= yourself.
+
 * Usage
 
 #+begin_src sh
