@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <thread>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -32,6 +33,11 @@ int usage(FILE* out)
         "  devices     list paired Bluetooth devices\n"
         "  status      show model, firmware, noise mode, battery\n"
         "  mode        print current noise mode (off | nc | ambient)\n"
+        "  mode MODE   set the noise mode\n"
+        "  nc          noise cancelling      (aliases: anc, noise-cancelling)\n"
+        "  ambient     ambient sound         (aliases: transparency, passthrough)\n"
+        "              flags: --level 1-20, --voice-focus on|off\n"
+        "  off         no noise control      (alias: normal)\n"
         "  battery     show battery levels\n"
         "  help        show this help\n");
     return out == stderr ? 2 : 0;
@@ -131,25 +137,31 @@ public:
         if (!pickDevice(conn, opt, mac, name))
             return false;
 
-        // v2 UUID first, legacy second (mirrors upstream's AUTO mode).
+        // v2 UUID first, legacy second (mirrors upstream's AUTO mode). Retried:
+        // the SDP record is briefly unavailable right after a previous session
+        // disconnects.
         const char* const services[] = {MDR_SERVICE_UUID_XM5, MDR_SERVICE_UUID_LEGACY};
         MDRResult r = MDR_RESULT_ERROR_NO_CONNECTION;
-        for (const char* uuid : services) {
-            r = mdrConnectionConnect(conn, mac.c_str(), uuid);
-            if (r == MDR_RESULT_OK || r == MDR_RESULT_INPROGRESS) {
-                const int64_t deadline = nowMs() + timeoutMs;
-                while (r != MDR_RESULT_OK && nowMs() < deadline) {
-                    r = mdrConnectionPoll(conn, 50);
-                    if (r != MDR_RESULT_OK && r != MDR_RESULT_INPROGRESS &&
-                        r != MDR_RESULT_ERROR_TIMEOUT)
-                        break;
-                    if (r == MDR_RESULT_ERROR_TIMEOUT)
-                        r = MDR_RESULT_INPROGRESS;
+        const int64_t connectDeadline = nowMs() + timeoutMs;
+        for (int attempt = 0; r != MDR_RESULT_OK && nowMs() < connectDeadline; ++attempt) {
+            if (attempt > 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            for (const char* uuid : services) {
+                r = mdrConnectionConnect(conn, mac.c_str(), uuid);
+                if (r == MDR_RESULT_OK || r == MDR_RESULT_INPROGRESS) {
+                    while (r != MDR_RESULT_OK && nowMs() < connectDeadline) {
+                        r = mdrConnectionPoll(conn, 50);
+                        if (r != MDR_RESULT_OK && r != MDR_RESULT_INPROGRESS &&
+                            r != MDR_RESULT_ERROR_TIMEOUT)
+                            break;
+                        if (r == MDR_RESULT_ERROR_TIMEOUT)
+                            r = MDR_RESULT_INPROGRESS;
+                    }
                 }
+                if (r == MDR_RESULT_OK)
+                    break;
+                mdrConnectionDisconnect(conn);
             }
-            if (r == MDR_RESULT_OK)
-                break;
-            mdrConnectionDisconnect(conn);
         }
         if (r != MDR_RESULT_OK) {
             std::fprintf(stderr, "sonyctl: cannot connect to %s: %s\n", name.c_str(),
@@ -298,6 +310,55 @@ int cmdMode(Session& s)
     return 0;
 }
 
+// Canonicalize a noise-mode word (with aliases); empty result = not a mode.
+std::string canonicalMode(const std::string& word)
+{
+    if (word == "nc" || word == "anc" || word == "noise-cancelling" || word == "noise-canceling")
+        return "nc";
+    if (word == "ambient" || word == "transparency" || word == "passthrough" || word == "asm")
+        return "ambient";
+    if (word == "off" || word == "normal" || word == "none")
+        return "off";
+    return {};
+}
+
+struct ModeFlags {
+    int level = -1;          // --level 1-20 (ambient only)
+    int voiceFocus = -1;     // --voice-focus on|off
+};
+
+int cmdSetMode(Session& s, const std::string& mode, const ModeFlags& flags)
+{
+    MDRNoiseControl nc{};
+    if (mdrHeadphonesGetNoiseControl(s.dev, &nc) != MDR_RESULT_OK) {
+        std::fprintf(stderr, "sonyctl: noise control not available\n");
+        return 1;
+    }
+    if (mode == "nc")
+        nc.mode = MDR_NOISE_MODE_CANCELLING;
+    else if (mode == "ambient")
+        nc.mode = MDR_NOISE_MODE_AMBIENT;
+    else
+        nc.mode = MDR_NOISE_MODE_OFF;
+    if (flags.level >= 0)
+        nc.ambient_level = static_cast<uint8_t>(flags.level);
+    if (flags.voiceFocus >= 0)
+        nc.focus_on_voice = flags.voiceFocus ? MDR_TRUE : MDR_FALSE;
+
+    if (mdrHeadphonesSetNoiseControl(s.dev, &nc) != MDR_RESULT_OK) {
+        std::fprintf(stderr, "sonyctl: setting noise control failed\n");
+        return 1;
+    }
+    if (!s.commit()) {
+        std::fprintf(stderr, "sonyctl: change was not applied\n");
+        return 1;
+    }
+    MDRNoiseControl applied{};
+    if (mdrHeadphonesGetNoiseControl(s.dev, &applied) == MDR_RESULT_OK)
+        printNoiseControl(applied);
+    return 0;
+}
+
 int cmdDevices(MDRConnection* conn)
 {
     MDRDeviceInfo* list = nullptr;
@@ -352,8 +413,46 @@ int main(int argc, char** argv)
     if (opt.command == "devices")
         return cmdDevices(holder.conn);
 
-    const bool knownCommand =
-        opt.command == "status" || opt.command == "mode" || opt.command == "battery";
+    // Resolve `mode <MODE>` and top-level mode shortcuts (nc/ambient/off + aliases).
+    std::string setMode;
+    ModeFlags modeFlags;
+    std::vector<std::string> rest = opt.args;
+    if (opt.command == "mode" && !rest.empty()) {
+        setMode = canonicalMode(rest.front());
+        if (setMode.empty()) {
+            std::fprintf(stderr, "sonyctl: unknown mode '%s'\n", rest.front().c_str());
+            return 2;
+        }
+        rest.erase(rest.begin());
+    } else if (opt.command != "mode") {
+        setMode = canonicalMode(opt.command);
+    }
+    for (size_t i = 0; i < rest.size(); ++i) {
+        const std::string& arg = rest[i];
+        auto flagValue = [&](const char* flag) -> std::string {
+            if (i + 1 >= rest.size()) {
+                std::fprintf(stderr, "sonyctl: %s requires a value\n", flag);
+                std::exit(2);
+            }
+            return rest[++i];
+        };
+        if (arg == "--level") {
+            modeFlags.level = std::atoi(flagValue("--level").c_str());
+            if (modeFlags.level < 1 || modeFlags.level > 20) {
+                std::fprintf(stderr, "sonyctl: --level must be 1-20\n");
+                return 2;
+            }
+        } else if (arg == "--voice-focus") {
+            const std::string v = flagValue("--voice-focus");
+            modeFlags.voiceFocus = (v == "on" || v == "yes" || v == "1") ? 1 : 0;
+        } else {
+            std::fprintf(stderr, "sonyctl: unknown argument '%s'\n", arg.c_str());
+            return 2;
+        }
+    }
+
+    const bool knownCommand = opt.command == "status" || opt.command == "mode" ||
+                              opt.command == "battery" || !setMode.empty();
     if (!knownCommand) {
         std::fprintf(stderr, "sonyctl: unknown command '%s'\n", opt.command.c_str());
         return usage(stderr);
@@ -363,9 +462,11 @@ int main(int argc, char** argv)
     if (!session.open(holder.conn, opt))
         return 1;
 
+    if (!setMode.empty())
+        return cmdSetMode(session, setMode, modeFlags);
     if (opt.command == "status")
         return cmdStatus(session);
-    if (opt.command == "mode" && opt.args.empty())
+    if (opt.command == "mode")
         return cmdMode(session);
     if (opt.command == "battery") {
         printBatteries(session);
