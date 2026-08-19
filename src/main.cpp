@@ -4,11 +4,13 @@
 // Built on libmdr / libmdr-bt from https://github.com/mos9527/SonyHeadphonesClient
 
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <thread>
 #include <cstring>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 #include <mdr-bt/ConnectionMacOS.h>
 #include <mdr-c/Base.h>
@@ -29,10 +31,112 @@ struct Options {
     std::vector<std::string> args;
 };
 
+// Output mode, set once from the command line.
+bool gJson = false;      // --json: machine-readable stdout
+bool gColorErr = false;  // colorize stderr (gray), per --color and isatty
+
+// Diagnostics always go to stderr so stdout stays parseable in both modes.
+void errf(const char* fmt, ...)
+{
+    char msg[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    // Callers keep a trailing newline for readability; strip it so the message
+    // can be embedded in JSON, and re-add it when printing.
+    size_t len = std::strlen(msg);
+    while (len && (msg[len - 1] == '\n' || msg[len - 1] == '\r'))
+        msg[--len] = '\0';
+
+    const char* on = gColorErr ? "\033[90m" : "";
+    const char* off = gColorErr ? "\033[0m" : "";
+    if (gJson) {
+        std::string escaped;
+        for (const char* p = msg; *p; ++p) {
+            if (*p == '"' || *p == '\\')
+                escaped += '\\', escaped += *p;
+            else if (static_cast<unsigned char>(*p) < 0x20)
+                escaped += ' ';
+            else
+                escaped += *p;
+        }
+        std::fprintf(stderr, "%s{\"error\":\"%s\"}%s\n", on, escaped.c_str(), off);
+    } else {
+        std::fprintf(stderr, "%s%s%s\n", on, msg, off);
+    }
+}
+
+// Minimal JSON object builder — enough for this tool's flat-ish output.
+class JsonObj {
+    std::string body;
+    void sep() { if (!body.empty()) body += ','; }
+
+public:
+    static std::string escape(const std::string& in)
+    {
+        std::string out;
+        for (char c : in) {
+            switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\t': out += "\\t"; break;
+            case '\r': out += "\\r"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20)
+                    out += ' ';
+                else
+                    out += c;
+            }
+        }
+        return out;
+    }
+    JsonObj& str(const char* key, const std::string& value)
+    {
+        sep();
+        body += '"' + std::string(key) + "\":\"" + escape(value) + '"';
+        return *this;
+    }
+    JsonObj& num(const char* key, long long value)
+    {
+        sep();
+        body += '"' + std::string(key) + "\":" + std::to_string(value);
+        return *this;
+    }
+    JsonObj& boolean(const char* key, bool value)
+    {
+        sep();
+        body += '"' + std::string(key) + "\":" + (value ? "true" : "false");
+        return *this;
+    }
+    // Insert an already-serialized JSON value (object, array, literal).
+    JsonObj& raw(const char* key, const std::string& value)
+    {
+        sep();
+        body += '"' + std::string(key) + "\":" + value;
+        return *this;
+    }
+    std::string dump() const { return "{" + body + "}"; }
+};
+
+void printJson(const JsonObj& obj)
+{
+    std::printf("%s\n", obj.dump().c_str());
+}
+
 int usage(FILE* out)
 {
     std::fprintf(out,
-        "usage: sonyctl [--mac AA:BB:CC:DD:EE:FF] [--device SUBSTR] <command> [args]\n"
+        "usage: sonyctl [options] <command> [args]\n"
+        "\n"
+        "options:\n"
+        "  --mac AA:BB:CC:DD:EE:FF   target a specific device\n"
+        "  --device SUBSTR           target the first device whose name matches\n"
+        "  --json                    machine-readable JSON on stdout\n"
+        "  --color=auto|always|never colorize diagnostics (default auto)\n"
+        "\n"
+        "Diagnostics always go to stderr, so stdout stays parseable.\n"
         "\n"
         "commands:\n"
         "  devices     list paired Bluetooth devices\n"
@@ -99,7 +203,7 @@ bool pickDevice(MDRConnection* conn, const Options& opt, std::string& outMac, st
     MDRDeviceInfo* list = nullptr;
     int count = 0;
     if (mdrConnectionGetDevicesList(conn, &list, &count) != MDR_RESULT_OK || count == 0) {
-        std::fprintf(stderr, "sonyctl: no paired Bluetooth devices found\n");
+        errf("sonyctl: no paired Bluetooth devices found\n");
         return false;
     }
     int found = -1;
@@ -108,7 +212,7 @@ bool pickDevice(MDRConnection* conn, const Options& opt, std::string& outMac, st
             if (std::strstr(list[i].szDeviceName, opt.nameFilter.c_str()))
                 found = i;
         if (found < 0)
-            std::fprintf(stderr, "sonyctl: no paired device matching '%s'\n", opt.nameFilter.c_str());
+            errf("sonyctl: no paired device matching '%s'\n", opt.nameFilter.c_str());
     } else {
         for (const char* pattern : kDefaultDevicePatterns) {
             for (int i = 0; i < count && found < 0; ++i)
@@ -118,9 +222,8 @@ bool pickDevice(MDRConnection* conn, const Options& opt, std::string& outMac, st
                 break;
         }
         if (found < 0)
-            std::fprintf(stderr,
-                         "sonyctl: no Sony headphone found among paired devices "
-                         "(try --device SUBSTR or --mac)\n");
+            errf("sonyctl: no Sony headphone found among paired devices "
+                 "(try --device SUBSTR or --mac)");
     }
     if (found >= 0) {
         outMac = list[found].szDeviceMacAddress;
@@ -177,23 +280,23 @@ public:
             }
         }
         if (r != MDR_RESULT_OK) {
-            std::fprintf(stderr, "sonyctl: cannot connect to %s: %s\n", name.c_str(),
+            errf("sonyctl: cannot connect to %s: %s\n", name.c_str(),
                          mdrConnectionGetLastError(conn));
             return false;
         }
 
         if (mdrHeadphonesCreate(MDR_ABI_VERSION, conn, &dev) != MDR_RESULT_OK) {
-            std::fprintf(stderr, "sonyctl: failed to create headphones instance\n");
+            errf("sonyctl: failed to create headphones instance\n");
             return false;
         }
         if (mdrHeadphonesRequestInit(dev) != MDR_RESULT_OK ||
             !waitEvent(MDR_EVENT_INITIALIZE_COMPLETE, timeoutMs)) {
-            std::fprintf(stderr, "sonyctl: protocol init failed or timed out\n");
+            errf("sonyctl: protocol init failed or timed out\n");
             return false;
         }
         if (mdrHeadphonesRequestFetch(dev) != MDR_RESULT_OK ||
             !waitEvent(MDR_EVENT_SYNC_COMPLETE, timeoutMs)) {
-            std::fprintf(stderr, "sonyctl: state sync failed or timed out\n");
+            errf("sonyctl: state sync failed or timed out\n");
             return false;
         }
         return true;
@@ -207,7 +310,7 @@ public:
             MDREvent event = MDR_EVENT_NONE;
             const MDRResult pr = mdrHeadphonesPoll(dev, &event);
             if (pr != MDR_RESULT_OK) {
-                std::fprintf(stderr, "sonyctl: connection lost while waiting: %s (%s / %s)\n",
+                errf("sonyctl: connection lost while waiting: %s (%s / %s)\n",
                              mdrResultString(pr), text(MDR_TEXT_LAST_ERROR).c_str(),
                              mdrConnectionGetLastError(conn));
                 return false;
@@ -234,7 +337,7 @@ public:
                 mdrConnectionPoll(conn, 20);
         }
         if (mdrHeadphonesRequestCommit(dev) != MDR_RESULT_OK) {
-            std::fprintf(stderr, "sonyctl: commit failed\n");
+            errf("sonyctl: commit failed\n");
             return false;
         }
         return waitEvent(MDR_EVENT_APPLY_COMPLETE, timeoutMs);
@@ -259,8 +362,23 @@ const char* noiseModeName(MDRNoiseMode mode)
     }
 }
 
+JsonObj noiseControlJson(const MDRNoiseControl& nc)
+{
+    JsonObj obj;
+    obj.str("mode", noiseModeName(nc.mode))
+        .num("ambient_level", nc.ambient_level)
+        .boolean("focus_on_voice", nc.focus_on_voice != MDR_FALSE)
+        .boolean("adaptive_ambient", nc.adaptive_ambient != MDR_FALSE)
+        .num("adaptive_sensitivity", nc.adaptive_sensitivity);
+    return obj;
+}
+
 void printNoiseControl(const MDRNoiseControl& nc)
 {
+    if (gJson) {
+        printJson(noiseControlJson(nc));
+        return;
+    }
     std::printf("mode: %s\n", noiseModeName(nc.mode));
     if (nc.mode == MDR_NOISE_MODE_AMBIENT) {
         std::printf("ambient level: %u\n", nc.ambient_level);
@@ -280,8 +398,49 @@ const char* batteryPartName(MDRBatteryPart part)
     }
 }
 
+const char* chargingName(MDRChargingState state)
+{
+    switch (state) {
+    case MDR_CHARGING_NO: return "no";
+    case MDR_CHARGING_YES: return "yes";
+    case MDR_CHARGING_COMPLETE: return "complete";
+    default: return "unknown";
+    }
+}
+
+// Serialized JSON array of the present batteries.
+std::string batteriesJson(Session& s)
+{
+    MDRBattery batteries[4];
+    uint32_t count = 4;
+    if (mdrHeadphonesGetBatteries(s.dev, batteries, &count) != MDR_RESULT_OK)
+        return "[]";
+    std::string out = "[";
+    bool first = true;
+    for (uint32_t i = 0; i < count; ++i) {
+        const MDRBattery& b = batteries[i];
+        if (!b.present)
+            continue;
+        JsonObj obj;
+        obj.str("part", batteryPartName(b.part))
+            .num("level_percent", b.level_percent)
+            .str("charging", chargingName(b.charging));
+        if (!first)
+            out += ',';
+        out += obj.dump();
+        first = false;
+    }
+    return out + "]";
+}
+
 void printBatteries(Session& s)
 {
+    if (gJson) {
+        JsonObj obj;
+        obj.raw("batteries", batteriesJson(s));
+        printJson(obj);
+        return;
+    }
     MDRBattery batteries[4];
     uint32_t count = 4;
     if (mdrHeadphonesGetBatteries(s.dev, batteries, &count) != MDR_RESULT_OK)
@@ -301,6 +460,16 @@ int cmdStatus(Session& s)
 {
     const std::string model = s.text(MDR_TEXT_MODEL_NAME);
     const std::string fw = s.text(MDR_TEXT_FIRMWARE_VERSION);
+    if (gJson) {
+        JsonObj obj;
+        obj.str("model", model).str("firmware", fw);
+        MDRNoiseControl nc{};
+        if (mdrHeadphonesGetNoiseControl(s.dev, &nc) == MDR_RESULT_OK)
+            obj.raw("noise", noiseControlJson(nc).dump());
+        obj.raw("batteries", batteriesJson(s));
+        printJson(obj);
+        return 0;
+    }
     if (!model.empty())
         std::printf("model: %s\n", model.c_str());
     if (!fw.empty())
@@ -316,8 +485,14 @@ int cmdMode(Session& s)
 {
     MDRNoiseControl nc{};
     if (mdrHeadphonesGetNoiseControl(s.dev, &nc) != MDR_RESULT_OK) {
-        std::fprintf(stderr, "sonyctl: noise control not available\n");
+        errf("sonyctl: noise control not available\n");
         return 1;
+    }
+    if (gJson) {
+        JsonObj obj;
+        obj.str("mode", noiseModeName(nc.mode));
+        printJson(obj);
+        return 0;
     }
     std::printf("%s\n", noiseModeName(nc.mode));
     return 0;
@@ -344,7 +519,7 @@ int cmdSetMode(Session& s, const std::string& mode, const ModeFlags& flags)
 {
     MDRNoiseControl nc{};
     if (mdrHeadphonesGetNoiseControl(s.dev, &nc) != MDR_RESULT_OK) {
-        std::fprintf(stderr, "sonyctl: noise control not available\n");
+        errf("sonyctl: noise control not available\n");
         return 1;
     }
     if (mode == "nc")
@@ -359,11 +534,11 @@ int cmdSetMode(Session& s, const std::string& mode, const ModeFlags& flags)
         nc.focus_on_voice = flags.voiceFocus ? MDR_TRUE : MDR_FALSE;
 
     if (mdrHeadphonesSetNoiseControl(s.dev, &nc) != MDR_RESULT_OK) {
-        std::fprintf(stderr, "sonyctl: setting noise control failed\n");
+        errf("sonyctl: setting noise control failed\n");
         return 1;
     }
     if (!s.commit()) {
-        std::fprintf(stderr, "sonyctl: change was not applied\n");
+        errf("sonyctl: change was not applied\n");
         return 1;
     }
     MDRNoiseControl applied{};
@@ -396,11 +571,11 @@ bool setMultipoint(Session& s, uint32_t index, bool enabled)
     setting.index = index;
     setting.boolean_value = enabled ? MDR_TRUE : MDR_FALSE;
     if (mdrHeadphonesSetGeneralSetting(s.dev, &setting) != MDR_RESULT_OK) {
-        std::fprintf(stderr, "sonyctl: setting multipoint failed\n");
+        errf("sonyctl: setting multipoint failed\n");
         return false;
     }
     if (!s.commit()) {
-        std::fprintf(stderr, "sonyctl: multipoint change was not applied\n");
+        errf("sonyctl: multipoint change was not applied\n");
         return false;
     }
     return true;
@@ -410,38 +585,62 @@ int cmdMultipoint(Session& s, const std::string& action)
 {
     const int index = findMultipointSetting(s);
     if (index < 0) {
-        std::fprintf(stderr, "sonyctl: no multipoint setting found on this device\n");
+        errf("sonyctl: no multipoint setting found on this device\n");
         return 1;
     }
     MDRGeneralSetting current{};
     if (mdrHeadphonesGetGeneralSetting(s.dev, static_cast<uint32_t>(index), &current) !=
         MDR_RESULT_OK) {
-        std::fprintf(stderr, "sonyctl: cannot read multipoint state\n");
+        errf("sonyctl: cannot read multipoint state\n");
         return 1;
     }
+    const bool was = current.boolean_value != MDR_FALSE;
     if (action.empty()) {
-        std::printf("multipoint: %s\n", current.boolean_value ? "on" : "off");
+        if (gJson) {
+            JsonObj obj;
+            obj.boolean("multipoint", was);
+            printJson(obj);
+        } else {
+            std::printf("multipoint: %s\n", was ? "on" : "off");
+        }
         return 0;
     }
     if (action == "on" || action == "off") {
-        if (!setMultipoint(s, static_cast<uint32_t>(index), action == "on"))
+        const bool want = action == "on";
+        if (!setMultipoint(s, static_cast<uint32_t>(index), want))
             return 1;
-        std::printf("multipoint: %s\n", action.c_str());
+        if (gJson) {
+            JsonObj obj;
+            obj.boolean("multipoint", want).boolean("previous", was).str("action", action);
+            printJson(obj);
+        } else {
+            std::printf("multipoint: %s\n", action.c_str());
+        }
         return 0;
     }
     if (action == "reset") {
-        std::printf("multipoint: %s -> off", current.boolean_value ? "on" : "off");
-        std::fflush(stdout);
+        if (!gJson) {
+            std::printf("multipoint: %s -> off", was ? "on" : "off");
+            std::fflush(stdout);
+        }
         if (!setMultipoint(s, static_cast<uint32_t>(index), false))
             return 1;
-        std::printf(" -> on");
-        std::fflush(stdout);
+        if (!gJson) {
+            std::printf(" -> on");
+            std::fflush(stdout);
+        }
         if (!setMultipoint(s, static_cast<uint32_t>(index), true))
             return 1;
-        std::printf(" (reset done)\n");
+        if (gJson) {
+            JsonObj obj;
+            obj.boolean("multipoint", true).boolean("previous", was).str("action", "reset");
+            printJson(obj);
+        } else {
+            std::printf(" (reset done)\n");
+        }
         return 0;
     }
-    std::fprintf(stderr, "sonyctl: multipoint takes on, off, or reset\n");
+    errf("sonyctl: multipoint takes on, off, or reset\n");
     return 2;
 }
 
@@ -449,18 +648,24 @@ int cmdPowerOff(Session& s)
 {
     MDRPower power{};
     if (mdrHeadphonesGetPower(s.dev, &power) != MDR_RESULT_OK) {
-        std::fprintf(stderr, "sonyctl: power control not available\n");
+        errf("sonyctl: power control not available\n");
         return 1;
     }
     power.shutdown_requested = MDR_TRUE;
     if (mdrHeadphonesSetPower(s.dev, &power) != MDR_RESULT_OK) {
-        std::fprintf(stderr, "sonyctl: power-off request failed\n");
+        errf("sonyctl: power-off request failed\n");
         return 1;
     }
     // The device drops the link while applying; a failed commit-wait here
     // just means the shutdown won the race.
     s.commit(5000);
-    std::printf("power-off sent\n");
+    if (gJson) {
+        JsonObj obj;
+        obj.boolean("power_off_sent", true);
+        printJson(obj);
+    } else {
+        std::printf("power-off sent\n");
+    }
     return 0;
 }
 
@@ -487,12 +692,25 @@ bool parseHex(const std::string& in, std::vector<uint8_t>& out)
     return true;
 }
 
-void dumpFrame(void*, MDRPacketDirection dir, const unsigned char* frame, int size)
+// In JSON mode frames are collected and emitted as one object at the end;
+// in human mode they stream out as they arrive.
+void dumpFrame(void* user, MDRPacketDirection dir, const unsigned char* frame, int size)
 {
-    std::printf("%s", dir == MDR_PACKET_DIRECTION_TX ? "TX " : "RX ");
-    for (int i = 0; i < size; ++i)
-        std::printf("%02x", frame[i]);
-    std::printf("\n");
+    std::string hex;
+    char byte[3];
+    for (int i = 0; i < size; ++i) {
+        std::snprintf(byte, sizeof byte, "%02x", frame[i]);
+        hex += byte;
+    }
+    const char* dirName = dir == MDR_PACKET_DIRECTION_TX ? "tx" : "rx";
+    if (gJson) {
+        auto* frames = static_cast<std::vector<std::string>*>(user);
+        JsonObj obj;
+        obj.str("dir", dirName).str("hex", hex);
+        frames->push_back(obj.dump());
+        return;
+    }
+    std::printf("%s %s\n", dir == MDR_PACKET_DIRECTION_TX ? "TX" : "RX", hex.c_str());
     std::fflush(stdout);
 }
 
@@ -500,10 +718,11 @@ int cmdRaw(Session& s, const std::string& hex, int listenSecs)
 {
     std::vector<uint8_t> payload;
     if (!parseHex(hex, payload)) {
-        std::fprintf(stderr, "sonyctl: raw payload must be an even-length hex string\n");
+        errf("sonyctl: raw payload must be an even-length hex string\n");
         return 2;
     }
-    mdrHeadphonesSetPacketCallback(s.dev, dumpFrame, nullptr);
+    std::vector<std::string> frames;
+    mdrHeadphonesSetPacketCallback(s.dev, dumpFrame, &frames);
 
     // Frame as an MDR data command and inject on the wire. Sequence numbering is
     // owned by the library's own sends; this probe path shares the channel, so a
@@ -519,7 +738,7 @@ int cmdRaw(Session& s, const std::string& hex, int listenSecs)
             s.conn, reinterpret_cast<const char*>(packed.data()),
             static_cast<int>(packed.size()), &sent);
         if (r != MDR_RESULT_OK && r != MDR_RESULT_INPROGRESS)
-            std::fprintf(stderr, "sonyctl: raw send failed: %s\n", mdrResultString(r));
+            errf("sonyctl: raw send failed: %s\n", mdrResultString(r));
     }
 
     const int64_t deadline = nowMs() + static_cast<int64_t>(listenSecs) * 1000;
@@ -531,6 +750,15 @@ int cmdRaw(Session& s, const std::string& hex, int listenSecs)
             mdrConnectionPoll(s.conn, 50);
     }
     mdrHeadphonesSetPacketCallback(s.dev, nullptr, nullptr);
+    if (gJson) {
+        std::string arr = "[";
+        for (size_t i = 0; i < frames.size(); ++i)
+            arr += (i ? "," : "") + frames[i];
+        arr += "]";
+        JsonObj obj;
+        obj.raw("frames", arr);
+        printJson(obj);
+    }
     return 0;
 }
 
@@ -540,14 +768,27 @@ int cmdDevices(MDRConnection* conn)
     int count = 0;
     const MDRResult r = mdrConnectionGetDevicesList(conn, &list, &count);
     if (r != MDR_RESULT_OK) {
-        std::fprintf(stderr, "sonyctl: cannot list devices: %s\n", mdrResultString(r));
+        errf("sonyctl: cannot list devices: %s\n", mdrResultString(r));
         return 1;
     }
-    for (int i = 0; i < count; ++i)
-        std::printf("%s  %s\n", list[i].szDeviceMacAddress, list[i].szDeviceName);
+    if (gJson) {
+        std::string arr = "[";
+        for (int i = 0; i < count; ++i) {
+            JsonObj obj;
+            obj.str("mac", list[i].szDeviceMacAddress).str("name", list[i].szDeviceName);
+            arr += (i ? "," : "") + obj.dump();
+        }
+        arr += "]";
+        JsonObj obj;
+        obj.raw("devices", arr);
+        printJson(obj);
+    } else {
+        for (int i = 0; i < count; ++i)
+            std::printf("%s  %s\n", list[i].szDeviceMacAddress, list[i].szDeviceName);
+    }
     mdrConnectionFreeDevicesList(conn, &list);
     if (count == 0)
-        std::fprintf(stderr, "sonyctl: no paired Bluetooth devices found\n");
+        errf("sonyctl: no paired Bluetooth devices found\n");
     return 0;
 }
 
@@ -556,11 +797,13 @@ int cmdDevices(MDRConnection* conn)
 int main(int argc, char** argv)
 {
     Options opt;
+    std::string colorMode = "auto"; // auto | always | never
+    bool wantHelp = false, wantVersion = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto needValue = [&](const char* flag) -> const char* {
             if (i + 1 >= argc) {
-                std::fprintf(stderr, "sonyctl: %s requires a value\n", flag);
+                errf("sonyctl: %s requires a value\n", flag);
                 std::exit(2);
             }
             return argv[++i];
@@ -569,23 +812,52 @@ int main(int argc, char** argv)
             opt.mac = needValue("--mac");
         else if (arg == "--device")
             opt.nameFilter = needValue("--device");
+        else if (arg == "--json")
+            gJson = true;
+        else if (arg.rfind("--color=", 0) == 0)
+            colorMode = arg.substr(8);
+        else if (arg == "--color")
+            colorMode = needValue("--color");
         else if (arg == "-h" || arg == "--help" || arg == "help")
-            return usage(stdout);
-        else if (arg == "-V" || arg == "--version" || arg == "version") {
-            std::printf("sonyctl %s\n", SONYCTL_VERSION);
-            return 0;
-        }
+            wantHelp = true;
+        else if (arg == "-V" || arg == "--version" || arg == "version")
+            wantVersion = true;
         else if (opt.command.empty())
             opt.command = arg;
         else
             opt.args.push_back(arg);
+    }
+
+    // Resolve output modes before anything can print.
+    if (colorMode == "auto")
+        gColorErr = isatty(fileno(stderr)) != 0;
+    else if (colorMode == "always")
+        gColorErr = true;
+    else if (colorMode == "never")
+        gColorErr = false;
+    else {
+        errf("sonyctl: --color takes auto, always, or never");
+        return 2;
+    }
+
+    if (wantHelp)
+        return usage(stdout);
+    if (wantVersion) {
+        if (gJson) {
+            JsonObj obj;
+            obj.str("version", SONYCTL_VERSION);
+            printJson(obj);
+        } else {
+            std::printf("sonyctl %s\n", SONYCTL_VERSION);
+        }
+        return 0;
     }
     if (opt.command.empty())
         return usage(stderr);
 
     ConnectionHolder holder;
     if (!holder.conn) {
-        std::fprintf(stderr, "sonyctl: failed to create Bluetooth connection backend\n");
+        errf("sonyctl: failed to create Bluetooth connection backend\n");
         return 1;
     }
 
@@ -599,7 +871,7 @@ int main(int argc, char** argv)
     if (opt.command == "mode" && !rest.empty()) {
         setMode = canonicalMode(rest.front());
         if (setMode.empty()) {
-            std::fprintf(stderr, "sonyctl: unknown mode '%s'\n", rest.front().c_str());
+            errf("sonyctl: unknown mode '%s'\n", rest.front().c_str());
             return 2;
         }
         rest.erase(rest.begin());
@@ -610,7 +882,7 @@ int main(int argc, char** argv)
         const std::string& arg = rest[i];
         auto flagValue = [&](const char* flag) -> std::string {
             if (i + 1 >= rest.size()) {
-                std::fprintf(stderr, "sonyctl: %s requires a value\n", flag);
+                errf("sonyctl: %s requires a value\n", flag);
                 std::exit(2);
             }
             return rest[++i];
@@ -618,14 +890,14 @@ int main(int argc, char** argv)
         if (arg == "--level") {
             modeFlags.level = std::atoi(flagValue("--level").c_str());
             if (modeFlags.level < 1 || modeFlags.level > 20) {
-                std::fprintf(stderr, "sonyctl: --level must be 1-20\n");
+                errf("sonyctl: --level must be 1-20\n");
                 return 2;
             }
         } else if (arg == "--voice-focus") {
             const std::string v = flagValue("--voice-focus");
             modeFlags.voiceFocus = (v == "on" || v == "yes" || v == "1") ? 1 : 0;
         } else {
-            std::fprintf(stderr, "sonyctl: unknown argument '%s'\n", arg.c_str());
+            errf("sonyctl: unknown argument '%s'\n", arg.c_str());
             return 2;
         }
     }
@@ -635,7 +907,7 @@ int main(int argc, char** argv)
     int rawListen = 3;
     if (opt.command == "raw") {
         if (opt.args.empty()) {
-            std::fprintf(stderr, "sonyctl: raw requires a hex payload\n");
+            errf("sonyctl: raw requires a hex payload\n");
             return 2;
         }
         rawHex = opt.args.front();
@@ -643,7 +915,7 @@ int main(int argc, char** argv)
             if (opt.args[i] == "--listen" && i + 1 < opt.args.size())
                 rawListen = std::atoi(opt.args[++i].c_str());
             else {
-                std::fprintf(stderr, "sonyctl: unknown raw argument '%s'\n", opt.args[i].c_str());
+                errf("sonyctl: unknown raw argument '%s'\n", opt.args[i].c_str());
                 return 2;
             }
         }
@@ -654,7 +926,7 @@ int main(int argc, char** argv)
                               opt.command == "power-off" || opt.command == "raw" ||
                               !setMode.empty();
     if (!knownCommand) {
-        std::fprintf(stderr, "sonyctl: unknown command '%s'\n", opt.command.c_str());
+        errf("sonyctl: unknown command '%s'\n", opt.command.c_str());
         return usage(stderr);
     }
 

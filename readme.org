@@ -85,6 +85,34 @@ sonyctl power-off                      # shut down (no remote power-on exists)
 sonyctl raw 6617 --listen 3            # send raw MDR payload, hex-dump frames
 #+end_src
 
+** Machine-readable output
+
+=--json= makes every command print a single JSON object on stdout:
+
+#+begin_src sh
+sonyctl --json status
+# {"model":"WF-1000XM6","firmware":"1.6.0",
+#  "noise":{"mode":"nc","ambient_level":8,"focus_on_voice":false,
+#           "adaptive_ambient":false,"adaptive_sensitivity":2},
+#  "batteries":[{"part":"left","level_percent":80,"charging":"no"}, ...]}
+
+sonyctl --json mode | jq -r .mode          # -> nc
+sonyctl --json battery | jq '.batteries[] | select(.part=="case") | .level_percent'
+sonyctl --json raw 6617 --listen 2 | jq -r '.frames[] | .dir + " " + .hex'
+#+end_src
+
+Diagnostics never go to stdout — in both modes they are written to stderr, as
+plain text normally and as ={"error": "..."}= under =--json=. So stdout stays
+parseable even when a command fails, and the exit status tells you what
+happened (=0= success, =1= runtime failure, =2= usage error).
+
+** Color
+
+Diagnostics on stderr are printed in gray when stderr is a terminal.
+=--color=auto= (the default) detects that; =--color=always= forces the escape
+codes on (useful when piping into a pager that interprets them) and
+=--color=never= disables them.
+
 Device selection: by default =sonyctl= picks the first paired device whose
 name looks like a Sony headphone (=WF-1000XM6= first, then other =WF-=/=WH-=
 models). Override with =--device SUBSTR= (name substring) or
