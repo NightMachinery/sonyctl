@@ -39,6 +39,10 @@ int usage(FILE* out)
         "              flags: --level 1-20, --voice-focus on|off\n"
         "  off         no noise control      (alias: normal)\n"
         "  battery     show battery levels\n"
+        "  multipoint  show multipoint state; 'multipoint on|off|reset' to change\n"
+        "              (reset = off then on; recovers buggy audio states in place)\n"
+        "  power-off   shut the headphones down (wake requires case/wear;\n"
+        "              the protocol has no remote power-on)\n"
         "  help        show this help\n");
     return out == stderr ? 2 : 0;
 }
@@ -359,6 +363,98 @@ int cmdSetMode(Session& s, const std::string& mode, const ModeFlags& flags)
     return 0;
 }
 
+// Locate the multipoint General Setting ("Connect to 2 devices simultaneously",
+// subject string MULTIPOINT_SETTING). Returns the setting index, or -1.
+int findMultipointSetting(Session& s)
+{
+    MDRGeneralSettingInfo infos[16];
+    uint32_t count = 16;
+    if (mdrHeadphonesGetGeneralSettingInfo(s.dev, infos, &count) != MDR_RESULT_OK)
+        return -1;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (infos[i].type != MDR_GENERAL_SETTING_BOOLEAN)
+            continue;
+        const std::string subject = s.text(MDR_TEXT_GENERAL_SETTING_SUBJECT, infos[i].index);
+        if (subject.find("MULTIPOINT") != std::string::npos)
+            return static_cast<int>(infos[i].index);
+    }
+    return -1;
+}
+
+bool setMultipoint(Session& s, uint32_t index, bool enabled)
+{
+    MDRGeneralSetting setting{};
+    setting.index = index;
+    setting.boolean_value = enabled ? MDR_TRUE : MDR_FALSE;
+    if (mdrHeadphonesSetGeneralSetting(s.dev, &setting) != MDR_RESULT_OK) {
+        std::fprintf(stderr, "sonyctl: setting multipoint failed\n");
+        return false;
+    }
+    if (!s.commit()) {
+        std::fprintf(stderr, "sonyctl: multipoint change was not applied\n");
+        return false;
+    }
+    return true;
+}
+
+int cmdMultipoint(Session& s, const std::string& action)
+{
+    const int index = findMultipointSetting(s);
+    if (index < 0) {
+        std::fprintf(stderr, "sonyctl: no multipoint setting found on this device\n");
+        return 1;
+    }
+    MDRGeneralSetting current{};
+    if (mdrHeadphonesGetGeneralSetting(s.dev, static_cast<uint32_t>(index), &current) !=
+        MDR_RESULT_OK) {
+        std::fprintf(stderr, "sonyctl: cannot read multipoint state\n");
+        return 1;
+    }
+    if (action.empty()) {
+        std::printf("multipoint: %s\n", current.boolean_value ? "on" : "off");
+        return 0;
+    }
+    if (action == "on" || action == "off") {
+        if (!setMultipoint(s, static_cast<uint32_t>(index), action == "on"))
+            return 1;
+        std::printf("multipoint: %s\n", action.c_str());
+        return 0;
+    }
+    if (action == "reset") {
+        std::printf("multipoint: %s -> off", current.boolean_value ? "on" : "off");
+        std::fflush(stdout);
+        if (!setMultipoint(s, static_cast<uint32_t>(index), false))
+            return 1;
+        std::printf(" -> on");
+        std::fflush(stdout);
+        if (!setMultipoint(s, static_cast<uint32_t>(index), true))
+            return 1;
+        std::printf(" (reset done)\n");
+        return 0;
+    }
+    std::fprintf(stderr, "sonyctl: multipoint takes on, off, or reset\n");
+    return 2;
+}
+
+int cmdPowerOff(Session& s)
+{
+    MDRPower power{};
+    if (mdrHeadphonesGetPower(s.dev, &power) != MDR_RESULT_OK) {
+        std::fprintf(stderr, "sonyctl: power control not available\n");
+        return 1;
+    }
+    power.shutdown_requested = MDR_TRUE;
+    if (mdrHeadphonesSetPower(s.dev, &power) != MDR_RESULT_OK) {
+        std::fprintf(stderr, "sonyctl: power-off request failed\n");
+        return 1;
+    }
+    // The device drops the link while applying; a failed commit-wait here
+    // just means the shutdown won the race.
+    s.commit(5000);
+    std::printf("power-off sent\n");
+    return 0;
+}
+
 int cmdDevices(MDRConnection* conn)
 {
     MDRDeviceInfo* list = nullptr;
@@ -427,7 +523,7 @@ int main(int argc, char** argv)
     } else if (opt.command != "mode") {
         setMode = canonicalMode(opt.command);
     }
-    for (size_t i = 0; i < rest.size(); ++i) {
+    for (size_t i = 0; !setMode.empty() && i < rest.size(); ++i) {
         const std::string& arg = rest[i];
         auto flagValue = [&](const char* flag) -> std::string {
             if (i + 1 >= rest.size()) {
@@ -452,7 +548,8 @@ int main(int argc, char** argv)
     }
 
     const bool knownCommand = opt.command == "status" || opt.command == "mode" ||
-                              opt.command == "battery" || !setMode.empty();
+                              opt.command == "battery" || opt.command == "multipoint" ||
+                              opt.command == "power-off" || !setMode.empty();
     if (!knownCommand) {
         std::fprintf(stderr, "sonyctl: unknown command '%s'\n", opt.command.c_str());
         return usage(stderr);
@@ -472,5 +569,9 @@ int main(int argc, char** argv)
         printBatteries(session);
         return 0;
     }
+    if (opt.command == "multipoint")
+        return cmdMultipoint(session, opt.args.empty() ? std::string() : opt.args.front());
+    if (opt.command == "power-off")
+        return cmdPowerOff(session);
     return usage(stderr);
 }
