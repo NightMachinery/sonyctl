@@ -142,6 +142,20 @@ Two practical notes:
   audio profiles (A2DP/HFP) finish negotiating a second or two later, so the
   earbuds may not be the default output device the very instant it exits.
 
+** Troubleshooting
+
+Lines like =FIXME-ACK Timeout. Retry 0/10= come from the upstream =libmdr=
+library, not from =sonyctl=. They mean the headphones did not acknowledge a
+packet in time — common for a second or two after the link comes up, after
+another MDR session closes, or while the device is busy. They go to *stderr*,
+never stdout, so they cannot corrupt =--json= output, and =sonyctl= retries the
+whole session (three attempts) before giving up, so a transient timeout usually
+recovers on its own.
+
+If a command does fail after the retries, the most likely cause is another MDR
+client holding the control channel — typically Sony's Sound Connect app on a
+phone that is connected to the same earbuds. Quit it and retry.
+
 ** Notes
 
 - A setting can only be changed by one MDR session at a time; quit Sony's

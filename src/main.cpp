@@ -251,13 +251,39 @@ public:
             mdrHeadphonesDestroy(dev);
     }
 
-    bool open(MDRConnection* connection, const Options& opt, int timeoutMs = 15000)
+    // The handshake fails transiently for a few seconds after the link is
+    // established, after another MDR session closes, or when the device is busy
+    // (upstream then logs "ACK Timeout" and gives up). Retry the whole session
+    // rather than surfacing that to the user.
+    bool open(MDRConnection* connection, const Options& opt, int attempts = 3)
     {
         conn = connection;
         std::string mac, name;
         if (!pickDevice(conn, opt, mac, name))
-            return false;
+            return false; // already reported
 
+        std::string err;
+        for (int attempt = 1; attempt <= attempts; ++attempt) {
+            if (openOnce(mac, name, 8000, err))
+                return true;
+            if (dev) {
+                mdrHeadphonesDestroy(dev);
+                dev = nullptr;
+            }
+            mdrConnectionDisconnect(conn);
+            if (attempt < attempts)
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        errf("sonyctl: %s after %d attempts (is another app using the headphones, "
+             "e.g. Sound Connect on a phone?)",
+             err.c_str(), attempts);
+        return false;
+    }
+
+private:
+    bool openOnce(const std::string& mac, const std::string& name, int timeoutMs,
+                  std::string& err)
+    {
         // v2 UUID first, legacy second (mirrors upstream's AUTO mode). Retried:
         // the SDP record is briefly unavailable right after a previous session
         // disconnects.
@@ -285,27 +311,28 @@ public:
             }
         }
         if (r != MDR_RESULT_OK) {
-            errf("sonyctl: cannot connect to %s: %s\n", name.c_str(),
-                         mdrConnectionGetLastError(conn));
+            err = "cannot connect to " + name + ": " + mdrConnectionGetLastError(conn);
             return false;
         }
 
         if (mdrHeadphonesCreate(MDR_ABI_VERSION, conn, &dev) != MDR_RESULT_OK) {
-            errf("sonyctl: failed to create headphones instance\n");
+            err = "failed to create headphones instance";
             return false;
         }
         if (mdrHeadphonesRequestInit(dev) != MDR_RESULT_OK ||
             !waitEvent(MDR_EVENT_INITIALIZE_COMPLETE, timeoutMs)) {
-            errf("sonyctl: protocol init failed or timed out\n");
+            err = "protocol init failed or timed out";
             return false;
         }
         if (mdrHeadphonesRequestFetch(dev) != MDR_RESULT_OK ||
             !waitEvent(MDR_EVENT_SYNC_COMPLETE, timeoutMs)) {
-            errf("sonyctl: state sync failed or timed out\n");
+            err = "state sync failed or timed out";
             return false;
         }
         return true;
     }
+
+public:
 
     // Pump the event loop until `target` arrives.
     bool waitEvent(MDREvent target, int timeoutMs = 10000)
@@ -314,12 +341,8 @@ public:
         while (nowMs() < deadline) {
             MDREvent event = MDR_EVENT_NONE;
             const MDRResult pr = mdrHeadphonesPoll(dev, &event);
-            if (pr != MDR_RESULT_OK) {
-                errf("sonyctl: connection lost while waiting: %s (%s / %s)\n",
-                             mdrResultString(pr), text(MDR_TEXT_LAST_ERROR).c_str(),
-                             mdrConnectionGetLastError(conn));
-                return false;
-            }
+            if (pr != MDR_RESULT_OK)
+                return false; // caller decides whether to retry or report
             if (event == target)
                 return true;
             if (event == MDR_EVENT_NONE)
