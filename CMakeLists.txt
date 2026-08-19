@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.31 FATAL_ERROR)
-project(sonyctl CXX)
+project(sonyctl VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,5 +32,6 @@ endforeach ()
 
 add_executable(sonyctl src/main.cpp)
 target_link_libraries(sonyctl PRIVATE mdr mdr-bt)
+target_compile_definitions(sonyctl PRIVATE SONYCTL_VERSION="${PROJECT_VERSION}")
 
 install(TARGETS sonyctl RUNTIME DESTINATION bin)

@@ -23,7 +23,30 @@ cmake --build build
 The build fetches the pinned upstream library source automatically
 (FetchContent); the only third-party dependency it pulls is =fmt=.
 
-** Install
+** Install a prebuilt binary
+
+Each tagged release publishes stripped macOS binaries — pick the one for your
+Mac (=arm64= for Apple Silicon, =x86_64= for Intel; =universal= contains both
+and is roughly twice the size):
+
+#+begin_src sh
+v=v0.1.0
+curl -fLO "https://github.com/NightMachinery/sonyctl/releases/download/$v/sonyctl-macos-arm64"
+xattr -d com.apple.quarantine sonyctl-macos-arm64   # downloaded binaries are unsigned
+chmod +x sonyctl-macos-arm64
+mv sonyctl-macos-arm64 ~/.local/bin/sonyctl
+#+end_src
+
+The binaries are not code-signed or notarized, so macOS quarantines them on
+download; the =xattr= line above clears that. =SHA256SUMS.txt= is attached to
+each release. Binaries require macOS 11 or newer.
+
+Note there is no fully static option: macOS has no static libc and forbids
+statically linking =libSystem=. All third-party code (libmdr, libmdr-bt, fmt)
+*is* statically linked in, so the binaries depend only on Apple system
+frameworks that ship with every Mac.
+
+** Install from source
 
 =install.sh= builds a Release binary and installs it to a local bin dir
 (default =~/.local/bin=):
@@ -83,6 +106,23 @@ models). Override with =--device SUBSTR= (name substring) or
 CLI tools inherit the Bluetooth permission of the terminal that launches
 them. If connections fail silently, grant your terminal app Bluetooth access
 in System Settings → Privacy & Security → Bluetooth.
+
+* Releasing
+
+Releases are cut by pushing a version tag; GitHub Actions
+([[file:.github/workflows/release.yml][.github/workflows/release.yml]]) builds
+the binaries and publishes them.
+
+1. Bump =project(sonyctl VERSION x.y.z ...)= in =CMakeLists.txt= and commit.
+2. =git tag vx.y.z && git push origin master --tags=
+
+The workflow builds arm64, x86_64, and universal binaries on a single
+Apple Silicon runner (the Intel slice is cross-compiled), strips them,
+generates =SHA256SUMS.txt=, and creates the GitHub Release with generated
+notes. Running it via =workflow_dispatch= builds and uploads workflow
+artifacts without publishing a release — useful for testing.
+
+=sonyctl version= prints the version compiled into the binary.
 
 * Documentation
 

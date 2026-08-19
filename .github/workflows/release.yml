@@ -1,0 +1,71 @@
+name: Release
+
+# Builds macOS binaries and attaches them to a GitHub Release when a version
+# tag is pushed (e.g. `git tag v0.1.0 && git push --tags`).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: # allows a manual dry run (builds, but publishes nothing)
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # macOS 14 runners are Apple Silicon; the x86_64 slice is cross-compiled
+    # here, which is why one job can produce every artifact.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (arm64, x86_64, universal)
+        run: |
+          set -eu
+          mkdir -p dist
+          build_one() {
+            name=$1 archs=$2
+            cmake -S . -B "build-$name" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_ARCHITECTURES="$archs" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+            cmake --build "build-$name" --config Release -j"$(sysctl -n hw.ncpu)"
+            strip -x "build-$name/sonyctl"
+            cp "build-$name/sonyctl" "dist/sonyctl-macos-$name"
+          }
+          build_one arm64     "arm64"
+          build_one x86_64    "x86_64"
+          build_one universal "arm64;x86_64"
+
+      - name: Verify artifacts
+        run: |
+          set -eu
+          for f in dist/*; do
+            printf '%s: %s\n' "$f" "$(lipo -archs "$f")"
+          done
+          # The runner is arm64, so this slice must run here.
+          ./dist/sonyctl-macos-arm64 --version
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sonyctl-macos
+          path: dist/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version=${GITHUB_REF_NAME#v}
+          cd dist
+          shasum -a 256 sonyctl-macos-* > SHA256SUMS.txt
+          cd ..
+          gh release create "$GITHUB_REF_NAME" \
+            --title "sonyctl $version" \
+            --generate-notes \
+            dist/sonyctl-macos-arm64 \
+            dist/sonyctl-macos-x86_64 \
+            dist/sonyctl-macos-universal \
+            dist/SHA256SUMS.txt

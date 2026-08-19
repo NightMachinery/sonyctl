@@ -16,6 +16,10 @@
 #include <mdr-c/Headphones.h>
 #include <mdr/Command.hpp>
 
+#ifndef SONYCTL_VERSION
+#define SONYCTL_VERSION "unknown"
+#endif
+
 namespace {
 
 struct Options {
@@ -47,6 +51,7 @@ int usage(FILE* out)
         "  raw HEX [--listen SECS]\n"
         "              send a raw MDR payload (hex) and hex-dump all frames\n"
         "              (e.g. 'raw 6617 --listen 3' = NCASM get param)\n"
+        "  version     print the sonyctl version\n"
         "  help        show this help\n");
     return out == stderr ? 2 : 0;
 }
@@ -566,6 +571,10 @@ int main(int argc, char** argv)
             opt.nameFilter = needValue("--device");
         else if (arg == "-h" || arg == "--help" || arg == "help")
             return usage(stdout);
+        else if (arg == "-V" || arg == "--version" || arg == "version") {
+            std::printf("sonyctl %s\n", SONYCTL_VERSION);
+            return 0;
+        }
         else if (opt.command.empty())
             opt.command = arg;
         else
