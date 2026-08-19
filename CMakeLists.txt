@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.31 FATAL_ERROR)
-project(sonyctl VERSION 0.2.0 LANGUAGES CXX)
+project(sonyctl VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,8 +30,11 @@ foreach (_mdr_bt_target mdr-bt mdr-bt_shared)
         "${sonyheadphonesclient_SOURCE_DIR}/libmdr-bt/include")
 endforeach ()
 
-add_executable(sonyctl src/main.cpp)
-target_link_libraries(sonyctl PRIVATE mdr mdr-bt)
+find_library(FOUNDATION_LIB Foundation REQUIRED)
+find_library(IOBLUETOOTH_LIB IOBluetooth REQUIRED)
+
+add_executable(sonyctl src/main.cpp src/bt_link.mm)
+target_link_libraries(sonyctl PRIVATE mdr mdr-bt ${FOUNDATION_LIB} ${IOBLUETOOTH_LIB})
 target_compile_definitions(sonyctl PRIVATE SONYCTL_VERSION="${PROJECT_VERSION}")
 
 install(TARGETS sonyctl RUNTIME DESTINATION bin)

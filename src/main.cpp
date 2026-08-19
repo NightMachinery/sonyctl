@@ -18,6 +18,8 @@
 #include <mdr-c/Headphones.h>
 #include <mdr/Command.hpp>
 
+#include "bt_link.h"
+
 #ifndef SONYCTL_VERSION
 #define SONYCTL_VERSION "unknown"
 #endif
@@ -140,6 +142,9 @@ int usage(FILE* out)
         "\n"
         "commands:\n"
         "  devices     list paired Bluetooth devices\n"
+        "  connect     connect this Mac's Bluetooth link to the headphones\n"
+        "  disconnect  drop this Mac's link only (other hosts stay connected)\n"
+        "  link        report whether this Mac is linked to the headphones\n"
         "  status      show model, firmware, noise mode, battery\n"
         "  mode        print current noise mode (off | nc | ambient)\n"
         "  mode MODE   set the noise mode\n"
@@ -762,6 +767,65 @@ int cmdRaw(Session& s, const std::string& hex, int listenSecs)
     return 0;
 }
 
+// connect / disconnect / link-status operate on this Mac's Bluetooth link only;
+// they do not need (and must not hold) an MDR control session.
+int cmdLink(MDRConnection* conn, const Options& opt, const std::string& action)
+{
+    std::string mac, name;
+    if (!pickDevice(conn, opt, mac, name))
+        return 1;
+
+    const int before = btLinkIsConnected(mac.c_str());
+    if (before < 0) {
+        errf("sonyctl: device %s not found", mac.c_str());
+        return 1;
+    }
+    if (action == "link") {
+        if (gJson) {
+            JsonObj obj;
+            obj.str("device", name).str("mac", mac).boolean("connected", before == 1);
+            printJson(obj);
+        } else {
+            std::printf("%s: %s\n", name.c_str(), before == 1 ? "connected" : "disconnected");
+        }
+        return 0;
+    }
+
+    const bool want = action == "connect";
+    const int rc = want ? btLinkOpen(mac.c_str()) : btLinkClose(mac.c_str());
+    if (rc != 0) {
+        errf("sonyctl: %s failed for %s (IOReturn 0x%x)", action.c_str(), name.c_str(), rc);
+        return 1;
+    }
+    // The link state settles asynchronously; poll briefly so we report reality.
+    int now = before;
+    const int64_t deadline = nowMs() + 5000;
+    while (nowMs() < deadline) {
+        now = btLinkIsConnected(mac.c_str());
+        if ((now == 1) == want)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if ((now == 1) != want) {
+        errf("sonyctl: %s did not take effect for %s", action.c_str(), name.c_str());
+        return 1;
+    }
+
+    if (gJson) {
+        JsonObj obj;
+        obj.str("device", name)
+            .str("mac", mac)
+            .boolean("connected", now == 1)
+            .boolean("previously_connected", before == 1)
+            .str("action", action);
+        printJson(obj);
+    } else {
+        std::printf("%s: %s%s\n", name.c_str(), now == 1 ? "connected" : "disconnected",
+                    (before == 1) == want ? " (already)" : "");
+    }
+    return 0;
+}
+
 int cmdDevices(MDRConnection* conn)
 {
     MDRDeviceInfo* list = nullptr;
@@ -863,6 +927,8 @@ int main(int argc, char** argv)
 
     if (opt.command == "devices")
         return cmdDevices(holder.conn);
+    if (opt.command == "connect" || opt.command == "disconnect" || opt.command == "link")
+        return cmdLink(holder.conn, opt, opt.command);
 
     // Resolve `mode <MODE>` and top-level mode shortcuts (nc/ambient/off + aliases).
     std::string setMode;

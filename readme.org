@@ -65,6 +65,9 @@ add. Under the hood this is just =cmake --install=, so you can also run
 
 #+begin_src sh
 sonyctl devices                        # list paired Bluetooth devices
+sonyctl link                           # is this Mac linked to the headphones?
+sonyctl disconnect                     # drop this Mac's link only
+sonyctl connect                        # re-link this Mac
 sonyctl status                         # model, firmware, noise mode, battery
 sonyctl mode                           # print current noise mode
 sonyctl battery                        # battery levels (left/right/case)
@@ -117,6 +120,27 @@ Device selection: by default =sonyctl= picks the first paired device whose
 name looks like a Sony headphone (=WF-1000XM6= first, then other =WF-=/=WH-=
 models). Override with =--device SUBSTR= (name substring) or
 =--mac 00:11:22:33:44:55=.
+
+** Connecting and disconnecting
+
+=connect= / =disconnect= act on *this Mac's* Bluetooth link only. Disconnecting
+frees the earbuds for another host without unpairing and without touching the
+links the earbuds hold to other devices over multipoint — unlike the paired-
+device management in Sony's app, which reaches across to other hosts.
+
+This is a different layer from everything else in =sonyctl=: the other commands
+speak Sony's MDR protocol over the control channel, while these open and close
+the underlying Bluetooth baseband link (=IOBluetoothDevice openConnection= /
+=closeConnection=, the same mechanism =blueutil= uses).
+
+Two practical notes:
+
+- On =disconnect=, macOS falls back to the built-in speakers, which resume
+  their own remembered volume — output volume is stored per device, so the
+  level you had in the earbuds does not carry over.
+- On =connect=, the command returns as soon as the baseband link is up; the
+  audio profiles (A2DP/HFP) finish negotiating a second or two later, so the
+  earbuds may not be the default output device the very instant it exits.
 
 ** Notes
 
