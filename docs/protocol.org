@@ -1,0 +1,97 @@
+#+title: Sony MDR protocol notes (as used by sonyctl)
+
+Working notes gathered while building =sonyctl=. All MAC addresses in this
+document are placeholders.
+
+* Transport
+
+Sony headphones expose their settings protocol ("MDR", the same one the Sound
+Connect app uses) over Bluetooth *Classic* RFCOMM — not BLE. Two service UUIDs
+exist, discovered via SDP on the paired device:
+
+- =956C7B26-D49A-4BA8-B03F-B17D393CB6E2= — protocol v2, 1000XM5 generation and
+  newer. This is what the WF-1000XM6 advertises.
+- =96CC203E-5068-46AD-B32D-E316F5E069BA= — protocol v1 (legacy), 1000XM4 and
+  older. Absent on the WF-1000XM6.
+
+The RFCOMM channel number is NOT fixed — it varies between models and firmware
+versions (observed: 9 on a WF-1000XM6 and a WF-1000XM3, 15 on WH-1000XM3, 18
+on WH-ULT900N). It must be resolved at runtime via an SDP query for the
+service UUID. =libmdr-bt='s macOS backend
+(=IOBluetoothDevice getServiceRecordForUUID= → =getRFCOMMChannelID=) does this.
+
+There is no app-level authentication: standard Bluetooth pairing is the only
+gate. Only one MDR session can be active at a time — a phone running Sound
+Connect will hold the channel.
+
+** Classic vs LE Audio
+
+Bluetooth Classic (BR/EDR) carries A2DP audio, HFP, and RFCOMM; Bluetooth LE
+carries GATT and (on new devices) LE Audio/LC3. The MDR control channel is
+RFCOMM and therefore Classic-only. Sony also has a BLE GATT fallback transport
+("Tandem over BLE HPC", UUID =5B833E20-6BC7-4802-8E9A-723CECA4BD8F=), which
+upstream implements only on Windows. macOS (as of Sonoma) does not support LE
+Audio, so Mac connections are always Classic and the RFCOMM path just works.
+
+* Framing (Tandem)
+
+#+begin_example
+0x3E | escaped( dataType:1 | seq:1 | length:4 BE | payload | checksum:1 ) | 0x3C
+checksum = sum(inner bytes) & 0xFF
+escape:  0x3C/0x3D/0x3E  ->  0x3D, (byte & 0xEF)
+#+end_example
+
+=dataType= 0x0C is table-1 MDR data, 0x01 is ACK. =seq= alternates 0/1; every
+received DATA frame must be ACKed with the flipped sequence number or the
+device retransmits forever. =libmdr= handles all of this
+(=mdr/Command.hpp=, =MDRPackCommand= / =MDRUnpackCommand=).
+
+* Noise control (NCASM, protocol v2 table 1)
+
+Command IDs (first payload byte):
+
+#+begin_example
+0x60 GET_CAPABILITY   0x61 RET_CAPABILITY
+0x62 GET_STATUS       0x63 RET_STATUS
+0x64 SET_STATUS       0x65 NTFY_STATUS
+0x66 GET_PARAM        0x67 RET_PARAM
+0x68 SET_PARAM        0x69 NTFY_PARAM
+#+end_example
+
+The second byte is the =NcAsmInquiredType=, which varies per model (the
+WF-1000XM6 uses one of the "dual NC mode switch + ambient seamless" variants);
+it must be learned from GET_CAPABILITY, not hardcoded. =libmdr= abstracts all
+of this behind =mdrHeadphonesGet/SetNoiseControl=.
+
+* Other operations used by sonyctl
+
+- Battery: exposed via =mdrHeadphonesGetBatteries= (left/right/case for
+  earbuds).
+- Multipoint ("Connect to 2 devices simultaneously"): a boolean General
+  Setting with subject string =MULTIPOINT_SETTING=, enumerated via
+  =mdrHeadphonesGetGeneralSettingInfo= + =MDR_TEXT_GENERAL_SETTING_SUBJECT=.
+  Toggling it off and on again resets the earbuds' audio pipeline in place —
+  useful for recovering from buggy states — without dropping pairing.
+- Power off: =mdrHeadphonesSetPower= with =shutdown_requested=. This is a
+  shutdown, not a restart: the protocol has no power-on or reboot opcode, and
+  a powered-off device has no Bluetooth link to receive one. Waking requires
+  physical interaction (case / wear detection).
+
+* Upstream libraries
+
+- [[https://github.com/mos9527/SonyHeadphonesClient][mos9527/SonyHeadphonesClient]] — =libmdr= (protocol, stable C ABI under
+  =include/mdr-c/=) and =libmdr-bt= (per-platform transport; macOS backend is
+  IOBluetooth). Pinned by commit in our =CMakeLists.txt=; the =v1-compat=
+  branch is upstream's active default branch.
+- [[https://github.com/AndreasOlofsson/mdr-protocol][AndreasOlofsson/mdr-protocol]] — original public protocol writeup (framing,
+  v1/v2 UUID split).
+- [[https://github.com/Leonard013/sony-ult-ctl][Leonard013/sony-ult-ctl]] — minimal macOS Python/Swift v2 client; good
+  plain-English protocol reference.
+
+* macOS specifics
+
+- CLI binaries cannot prompt for Bluetooth TCC permission; they inherit the
+  grant of the launching terminal. Grant the terminal Bluetooth access in
+  System Settings → Privacy & Security → Bluetooth.
+- IOBluetooth delegate callbacks require a pumped run loop; =libmdr-bt='s
+  =Poll= pumps =NSRunLoop= internally, so a single-threaded poll loop works.

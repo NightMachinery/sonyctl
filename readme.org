@@ -1,0 +1,49 @@
+#+title: sonyctl — Sony headphones CLI for macOS
+
+Observe and change settings on Sony headphones (built and tested with the
+WF-1000XM6 earbuds; should work with any "protocol v2" model, i.e. the
+1000XM5 generation and newer) from the macOS command line.
+
+macOS has no native UI for Sony's headphone settings and Sony ships no macOS
+app. The headphones, however, speak Sony's proprietary MDR protocol over a
+Bluetooth Classic RFCOMM channel that any paired host may use. =sonyctl= is a
+thin CLI over [[https://github.com/mos9527/SonyHeadphonesClient][mos9527/SonyHeadphonesClient]]'s =libmdr= / =libmdr-bt=
+libraries, which implement that protocol.
+
+* Building
+
+Requires macOS, CMake >= 3.31, and a C++20 compiler (Apple clang works).
+
+#+begin_src sh
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/sonyctl help
+#+end_src
+
+The build fetches the pinned upstream library source automatically
+(FetchContent); the only third-party dependency it pulls is =fmt=.
+
+* Usage
+
+#+begin_src sh
+sonyctl devices                 # list paired Bluetooth devices
+#+end_src
+
+Device selection: by default =sonyctl= picks the first paired device whose
+name looks like a Sony headphone (=WF-1000XM6= first, then other =WF-=/=WH-=
+models). Override with =--device SUBSTR= (name substring) or
+=--mac 00:11:22:33:44:55=.
+
+More commands (noise mode, battery, multipoint, raw) are being added; see
+=sonyctl help=.
+
+* Bluetooth permission (TCC)
+
+CLI tools inherit the Bluetooth permission of the terminal that launches
+them. If connections fail silently, grant your terminal app Bluetooth access
+in System Settings → Privacy & Security → Bluetooth.
+
+* Documentation
+
+See [[file:docs/protocol.org][docs/protocol.org]] for notes on the MDR protocol and the upstream
+libraries.
