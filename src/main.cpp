@@ -14,6 +14,7 @@
 #include <mdr-c/Base.h>
 #include <mdr-c/Connection.h>
 #include <mdr-c/Headphones.h>
+#include <mdr/Command.hpp>
 
 namespace {
 
@@ -43,6 +44,9 @@ int usage(FILE* out)
         "              (reset = off then on; recovers buggy audio states in place)\n"
         "  power-off   shut the headphones down (wake requires case/wear;\n"
         "              the protocol has no remote power-on)\n"
+        "  raw HEX [--listen SECS]\n"
+        "              send a raw MDR payload (hex) and hex-dump all frames\n"
+        "              (e.g. 'raw 6617 --listen 3' = NCASM get param)\n"
         "  help        show this help\n");
     return out == stderr ? 2 : 0;
 }
@@ -455,6 +459,76 @@ int cmdPowerOff(Session& s)
     return 0;
 }
 
+bool parseHex(const std::string& in, std::vector<uint8_t>& out)
+{
+    std::string s;
+    for (char c : in)
+        if (c != ' ' && c != ':' && c != '_')
+            s.push_back(c);
+    if (s.empty() || s.size() % 2 != 0)
+        return false;
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < s.size(); i += 2) {
+        const int hi = nibble(s[i]), lo = nibble(s[i + 1]);
+        if (hi < 0 || lo < 0)
+            return false;
+        out.push_back(static_cast<uint8_t>(hi << 4 | lo));
+    }
+    return true;
+}
+
+void dumpFrame(void*, MDRPacketDirection dir, const unsigned char* frame, int size)
+{
+    std::printf("%s", dir == MDR_PACKET_DIRECTION_TX ? "TX " : "RX ");
+    for (int i = 0; i < size; ++i)
+        std::printf("%02x", frame[i]);
+    std::printf("\n");
+    std::fflush(stdout);
+}
+
+int cmdRaw(Session& s, const std::string& hex, int listenSecs)
+{
+    std::vector<uint8_t> payload;
+    if (!parseHex(hex, payload)) {
+        std::fprintf(stderr, "sonyctl: raw payload must be an even-length hex string\n");
+        return 2;
+    }
+    mdrHeadphonesSetPacketCallback(s.dev, dumpFrame, nullptr);
+
+    // Frame as an MDR data command and inject on the wire. Sequence numbering is
+    // owned by the library's own sends; this probe path shares the channel, so a
+    // seq clash is possible — fine for observation, which is the point of `raw`.
+    // The injected frame bypasses the library's send path, so it is not echoed by
+    // the packet callback; the device's reply and all other traffic still are.
+    if (!payload.empty()) {
+        mdr::MDRBuffer packed = mdr::MDRPackCommand(
+            mdr::MDRDataType::DATA_MDR, 0,
+            mdr::Span<const mdr::UInt8>(payload.data(), payload.size()));
+        int sent = 0;
+        const MDRResult r = mdrConnectionSend(
+            s.conn, reinterpret_cast<const char*>(packed.data()),
+            static_cast<int>(packed.size()), &sent);
+        if (r != MDR_RESULT_OK && r != MDR_RESULT_INPROGRESS)
+            std::fprintf(stderr, "sonyctl: raw send failed: %s\n", mdrResultString(r));
+    }
+
+    const int64_t deadline = nowMs() + static_cast<int64_t>(listenSecs) * 1000;
+    while (nowMs() < deadline) {
+        MDREvent event = MDR_EVENT_NONE;
+        if (mdrHeadphonesPoll(s.dev, &event) != MDR_RESULT_OK)
+            break;
+        if (event == MDR_EVENT_NONE)
+            mdrConnectionPoll(s.conn, 50);
+    }
+    mdrHeadphonesSetPacketCallback(s.dev, nullptr, nullptr);
+    return 0;
+}
+
 int cmdDevices(MDRConnection* conn)
 {
     MDRDeviceInfo* list = nullptr;
@@ -547,9 +621,29 @@ int main(int argc, char** argv)
         }
     }
 
+    // raw <hex> [--listen SECS]
+    std::string rawHex;
+    int rawListen = 3;
+    if (opt.command == "raw") {
+        if (opt.args.empty()) {
+            std::fprintf(stderr, "sonyctl: raw requires a hex payload\n");
+            return 2;
+        }
+        rawHex = opt.args.front();
+        for (size_t i = 1; i < opt.args.size(); ++i) {
+            if (opt.args[i] == "--listen" && i + 1 < opt.args.size())
+                rawListen = std::atoi(opt.args[++i].c_str());
+            else {
+                std::fprintf(stderr, "sonyctl: unknown raw argument '%s'\n", opt.args[i].c_str());
+                return 2;
+            }
+        }
+    }
+
     const bool knownCommand = opt.command == "status" || opt.command == "mode" ||
                               opt.command == "battery" || opt.command == "multipoint" ||
-                              opt.command == "power-off" || !setMode.empty();
+                              opt.command == "power-off" || opt.command == "raw" ||
+                              !setMode.empty();
     if (!knownCommand) {
         std::fprintf(stderr, "sonyctl: unknown command '%s'\n", opt.command.c_str());
         return usage(stderr);
@@ -573,5 +667,7 @@ int main(int argc, char** argv)
         return cmdMultipoint(session, opt.args.empty() ? std::string() : opt.args.front());
     if (opt.command == "power-off")
         return cmdPowerOff(session);
+    if (opt.command == "raw")
+        return cmdRaw(session, rawHex, rawListen);
     return usage(stderr);
 }
