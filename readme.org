@@ -71,6 +71,7 @@ sonyctl connect                        # re-link this Mac
 sonyctl status                         # model, firmware, noise mode, battery
 sonyctl mode                           # print current noise mode
 sonyctl battery                        # battery levels (left/right/case)
+sonyctl --auto-connect battery         # ...connecting first if not linked
 
 # noise control (aliases in parentheses)
 sonyctl nc                             # noise cancelling (anc, noise-cancelling)
@@ -107,7 +108,12 @@ sonyctl --json raw 6617 --listen 2 | jq -r '.frames[] | .dir + " " + .hex'
 Diagnostics never go to stdout — in both modes they are written to stderr, as
 plain text normally and as ={"error": "..."}= under =--json=. So stdout stays
 parseable even when a command fails, and the exit status tells you what
-happened (=0= success, =1= runtime failure, =2= usage error).
+happened (=0= success, =1= runtime failure, =2= usage error, =3= headphones
+not connected).
+
+=3= is worth special-casing in a script: it is the ordinary "they are in the
+case" answer, not a malfunction, and it arrives in milliseconds. A poller can
+treat it as "nothing to do" and treat =1= as something worth reporting.
 
 ** Color
 
@@ -120,6 +126,38 @@ Device selection: by default =sonyctl= picks the first paired device whose
 name looks like a Sony headphone (=WF-1000XM6= first, then other =WF-=/=WH-=
 models). Override with =--device SUBSTR= (name substring) or
 =--mac 00:11:22:33:44:55=.
+
+** Commands never connect on their own
+
+Every command that speaks the MDR protocol — =status=, =battery=, =mode=, the
+noise-control commands, =multipoint=, =raw=, =power-off= — requires that this
+Mac already be linked to the headphones. If it is not, the command fails
+immediately with exit status =3= and *does not* bring the link up:
+
+#+begin_src sh
+sonyctl battery
+# sonyctl: WF-1000XM6 is not connected (run 'sonyctl connect', or pass --auto-connect)
+#+end_src
+
+This is deliberate. Opening the MDR control channel is not a passive act: it
+opens an RFCOMM channel, and IOBluetooth establishes the baseband link on its
+own to service it. Left ungated, a plain =sonyctl battery= would wake the
+headphones and take over the system's audio output a second later — a
+surprising thing for a read-only command to do, and one that makes polling
+from =cron= impossible, since every tick would hold the headphones awake.
+
+Pass =--auto-connect= when connecting *is* what you want. It calls the same
+code path as =sonyctl connect= before starting the session, so the connect is
+deliberate rather than a side effect:
+
+#+begin_src sh
+sonyctl --auto-connect battery      # connect first if needed, then read
+sonyctl connect && sonyctl nc       # equivalent, in two steps
+#+end_src
+
+A side benefit: an unreachable device now fails in milliseconds instead of
+spending the full retry budget (three attempts, 8 seconds each) rediscovering
+that it cannot be reached.
 
 ** Connecting and disconnecting
 
@@ -152,9 +190,15 @@ never stdout, so they cannot corrupt =--json= output, and =sonyctl= retries the
 whole session (three attempts) before giving up, so a transient timeout usually
 recovers on its own.
 
-If a command does fail after the retries, the most likely cause is another MDR
-client holding the control channel — typically Sony's Sound Connect app on a
-phone that is connected to the same earbuds. Quit it and retry.
+If a command fails instantly with =is not connected= and exit status =3=, the
+headphones are simply not linked to this Mac — see [[*Commands never connect on
+their own][Commands never connect on their own]]. Run =sonyctl connect= first,
+or pass =--auto-connect=.
+
+If a command fails *after* the retries (exit status =1=), the most likely cause
+is another MDR client holding the control channel — typically Sony's Sound
+Connect app on a phone that is connected to the same earbuds. Quit it and
+retry.
 
 ** Notes
 

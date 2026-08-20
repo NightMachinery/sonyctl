@@ -29,6 +29,7 @@ namespace {
 struct Options {
     std::string mac;        // --mac override
     std::string nameFilter; // --device substring match
+    bool autoConnect = false; // --auto-connect: bring the link up if it is down
     std::string command;
     std::vector<std::string> args;
 };
@@ -137,8 +138,11 @@ int usage(FILE* out)
         "  --device SUBSTR           target the first device whose name matches\n"
         "  --json                    machine-readable JSON on stdout\n"
         "  --color=auto|always|never colorize diagnostics (default auto)\n"
+        "  --auto-connect            connect the headphones first if this Mac is\n"
+        "                            not linked to them (default: fail, exit 3)\n"
         "\n"
         "Diagnostics always go to stderr, so stdout stays parseable.\n"
+        "Exit status: 0 ok, 1 failure, 2 usage error, 3 not connected.\n"
         "\n"
         "commands:\n"
         "  devices     list paired Bluetooth devices\n"
@@ -196,6 +200,21 @@ int64_t nowMs()
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+// The baseband link settles asynchronously, so openConnection/closeConnection
+// returning is not the same as the link having changed state. Poll until it
+// has. Returns whether the link reached `want` before the deadline.
+bool btLinkWait(const std::string& mac, bool want, int timeoutMs)
+{
+    const int64_t deadline = nowMs() + timeoutMs;
+    for (;;) {
+        if ((btLinkIsConnected(mac.c_str()) == 1) == want)
+            return true;
+        if (nowMs() >= deadline)
+            return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
 // Pick the target device: --mac wins, then --device substring, then the
 // default Sony name patterns.
 bool pickDevice(MDRConnection* conn, const Options& opt, std::string& outMac, std::string& outName)
@@ -244,6 +263,9 @@ class Session {
 public:
     MDRConnection* conn = nullptr;
     MDRHeadphones* dev = nullptr;
+    // Exit status to use when open() fails; see the exit code table in the
+    // readme. Only the not-connected path deviates from the generic 1.
+    int failCode = 1;
 
     ~Session()
     {
@@ -260,6 +282,9 @@ public:
         conn = connection;
         std::string mac, name;
         if (!pickDevice(conn, opt, mac, name))
+            return false; // already reported
+
+        if (!ensureLinked(mac, name, opt))
             return false; // already reported
 
         std::string err;
@@ -281,6 +306,48 @@ public:
     }
 
 private:
+    // Refuse to reach a device this Mac is not already linked to.
+    //
+    // Opening the MDR control channel is not a passive act: mdrConnectionConnect
+    // opens an RFCOMM channel, and IOBluetooth brings the baseband link up on
+    // its own to service it. So without this gate a plain `sonyctl battery'
+    // wakes the headphones and steals the system's audio output a second later
+    // -- a surprising side effect for a command that only reads, and one that
+    // makes polling from cron impossible because every tick would hold the
+    // headphones awake. Connecting is what `connect' and --auto-connect are for.
+    //
+    // This is also why an unreachable device now fails in milliseconds rather
+    // than spending the full retry budget (3 x 8s) discovering the same thing.
+    bool ensureLinked(const std::string& mac, const std::string& name, const Options& opt)
+    {
+        const int linked = btLinkIsConnected(mac.c_str());
+        if (linked == 1)
+            return true;
+        if (linked < 0) {
+            errf("sonyctl: device %s not found", mac.c_str());
+            return false;
+        }
+
+        if (!opt.autoConnect) {
+            errf("sonyctl: %s is not connected (run 'sonyctl connect', or pass "
+                 "--auto-connect)",
+                 name.c_str());
+            failCode = 3;
+            return false;
+        }
+
+        const int rc = btLinkOpen(mac.c_str());
+        if (rc != 0) {
+            errf("sonyctl: connect failed for %s (IOReturn 0x%x)", name.c_str(), rc);
+            return false;
+        }
+        if (!btLinkWait(mac, true, 5000)) {
+            errf("sonyctl: %s did not come up within 5s", name.c_str());
+            return false;
+        }
+        return true;
+    }
+
     bool openOnce(const std::string& mac, const std::string& name, int timeoutMs,
                   std::string& err)
     {
@@ -821,18 +888,11 @@ int cmdLink(MDRConnection* conn, const Options& opt, const std::string& action)
         return 1;
     }
     // The link state settles asynchronously; poll briefly so we report reality.
-    int now = before;
-    const int64_t deadline = nowMs() + 5000;
-    while (nowMs() < deadline) {
-        now = btLinkIsConnected(mac.c_str());
-        if ((now == 1) == want)
-            break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    if ((now == 1) != want) {
+    if (!btLinkWait(mac, want, 5000)) {
         errf("sonyctl: %s did not take effect for %s", action.c_str(), name.c_str());
         return 1;
     }
+    const int now = btLinkIsConnected(mac.c_str());
 
     if (gJson) {
         JsonObj obj;
@@ -901,6 +961,8 @@ int main(int argc, char** argv)
             opt.nameFilter = needValue("--device");
         else if (arg == "--json")
             gJson = true;
+        else if (arg == "--auto-connect")
+            opt.autoConnect = true;
         else if (arg.rfind("--color=", 0) == 0)
             colorMode = arg.substr(8);
         else if (arg == "--color")
@@ -1021,7 +1083,7 @@ int main(int argc, char** argv)
 
     Session session;
     if (!session.open(holder.conn, opt))
-        return 1;
+        return session.failCode;
 
     if (!setMode.empty())
         return cmdSetMode(session, setMode, modeFlags);
